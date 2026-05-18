@@ -1,0 +1,1327 @@
+@page "/"
+@page "/rooms/{RoomId:int}"
+@implements IAsyncDisposable
+@using Microsoft.AspNetCore.SignalR.Client
+@using Microsoft.JSInterop
+@inject HttpClient Http
+@inject IJSRuntime JS
+
+@if (currentUser is null)
+{
+    <section class="auth-shell">
+        <aside class="auth-brand">
+            <div class="brand-mark">D</div>
+            <h1>DevSync</h1>
+            <p>팀 채팅, 업무 보드, 초대 기반 프로젝트 룸을 하나의 워크스페이스로 묶었습니다.</p>
+            <div class="demo-box">
+                <span>데모 계정</span>
+                <strong>hong@example.com</strong>
+                <small>Password123!</small>
+            </div>
+        </aside>
+
+        <section class="auth-card">
+            <div class="auth-tabs">
+                <button class="@(isRegisterMode ? "" : "active")" @onclick="() => SetAuthMode(false)">로그인</button>
+                <button class="@(isRegisterMode ? "active" : "")" @onclick="() => SetAuthMode(true)">회원가입</button>
+            </div>
+
+            @if (!string.IsNullOrWhiteSpace(errorMessage))
+            {
+                <div class="alert">@errorMessage</div>
+            }
+
+            @if (isRegisterMode)
+            {
+                <form class="auth-form" @onsubmit="RegisterAsync" @onsubmit:preventDefault="true">
+                    <label>이름 <input @bind="registerName" placeholder="홍길동" /></label>
+                    <label>이메일 <input @bind="registerEmail" placeholder="name@example.com" /></label>
+                    <label>비밀번호 <input @bind="registerPassword" type="password" placeholder="8자 이상" /></label>
+                    <button type="submit" disabled="@isBusy">회원가입</button>
+                </form>
+            }
+            else
+            {
+                <form class="auth-form" @onsubmit="LoginAsync" @onsubmit:preventDefault="true">
+                    <label>이메일 <input @bind="loginEmail" placeholder="hong@example.com" /></label>
+                    <label>비밀번호 <input @bind="loginPassword" type="password" placeholder="Password123!" /></label>
+                    <button type="submit" disabled="@isBusy">로그인</button>
+                </form>
+            }
+        </section>
+    </section>
+}
+else if (!roomLoaded)
+{
+    <section class="home-shell">
+        <aside class="home-sidebar">
+            <div class="brand-row">
+                <div class="brand-mark small">D</div>
+                <strong>DevSync</strong>
+            </div>
+            <button class="sidebar-action" @onclick="LogoutAsync">로그아웃</button>
+        </aside>
+
+        <main class="home-main">
+            <header class="home-header">
+                <div>
+                    <h1>@(currentUser.DisplayName)님의 워크스페이스</h1>
+                    <p>@currentUser.Email</p>
+                </div>
+                <div class="notification-center">
+                    <button type="button"
+                            class="notification-button @(UnreadMentionCount > 0 ? "has-unread" : "")"
+                            title="멘션 알림"
+                            @onclick="ToggleNotificationPanel">
+                        <svg class="bell-icon" viewBox="0 0 24 24" aria-hidden="true">
+                            <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"></path>
+                            <path d="M13.7 21a2 2 0 0 1-3.4 0"></path>
+                        </svg>
+                        <em>멘션</em>
+                        @if (UnreadMentionCount > 0)
+                        {
+                            <span>@UnreadMentionCount</span>
+                        }
+                    </button>
+                    @if (showNotificationPanel)
+                    {
+                        <section class="notification-popover">
+                            <div class="notification-header">
+                                <strong>멘션 알림</strong>
+                                @if (mentionNotifications.Count > 0)
+                                {
+                                    <button type="button" @onclick="MarkAllNotificationsReadAsync">모두 읽음</button>
+                                }
+                            </div>
+                            @if (mentionNotifications.Count == 0)
+                            {
+                                <p class="empty-notification">새 멘션이 없습니다.</p>
+                            }
+                            else
+                            {
+                                @foreach (var notification in mentionNotifications.OrderByDescending(x => x.CreatedAt))
+                                {
+                                    <button type="button"
+                                            class="notification-item @(notification.IsRead ? "read" : "")"
+                                            @onclick="() => OpenNotificationAsync(notification)">
+                                        <span># @notification.RoomName</span>
+                                        <strong>@notification.Title</strong>
+                                        <small>@notification.Body</small>
+                                    </button>
+                                }
+                            }
+                        </section>
+                    }
+                </div>
+            </header>
+
+            @if (!string.IsNullOrWhiteSpace(errorMessage))
+            {
+                <div class="alert">@errorMessage</div>
+            }
+
+            @if (!string.IsNullOrWhiteSpace(successMessage))
+            {
+                <div class="notice">@successMessage</div>
+            }
+
+            <section class="home-grid">
+                <section class="workspace-panel">
+                    <h2>내 프로젝트 룸</h2>
+                    @if (myRooms.Count == 0)
+                    {
+                        <p class="muted">아직 참여 중인 룸이 없습니다. 새 룸을 만들거나 초대 토큰으로 참여하세요.</p>
+                    }
+                    else
+                    {
+                        @foreach (var room in myRooms)
+                        {
+                            <article class="room-row">
+                                <div>
+                                    <strong>@room.Name</strong>
+                                    <span>@(room.IsOwner ? "방장" : room.IsApproved ? "멤버" : "승인 대기")</span>
+                                </div>
+                                <div class="room-row-actions">
+                                    <button disabled="@(!room.IsApproved)" @onclick="() => EnterRoomAsync(room.Id)">
+                                        @(room.IsApproved ? "입장" : "대기")
+                                    </button>
+                                    <button class="danger-light" disabled="@room.IsOwner" title="방장은 탈퇴할 수 없습니다." @onclick="() => LeaveMembershipAsync(room)">
+                                        탈퇴
+                                    </button>
+                                </div>
+                            </article>
+                        }
+                    }
+                </section>
+
+                <section class="workspace-panel">
+                    <h2>새 룸 만들기</h2>
+                    <form class="stack-form" @onsubmit="CreateRoomAsync" @onsubmit:preventDefault="true">
+                        <input @bind="newRoomName" placeholder="예: 쇼핑몰 팀 프로젝트" />
+                        <button type="submit" disabled="@isBusy">생성하고 입장</button>
+                    </form>
+                </section>
+
+                <section class="workspace-panel">
+                    <h2>초대 토큰으로 참여</h2>
+                    <form class="stack-form" @onsubmit="JoinByTokenAsync" @onsubmit:preventDefault="true">
+                        <input @bind="inviteTokenInput" placeholder="devsync-demo-token" />
+                        <button type="submit" disabled="@isBusy">참여 신청</button>
+                    </form>
+                </section>
+            </section>
+        </main>
+    </section>
+}
+else
+{
+    <section class="app-frame">
+        <aside class="room-sidebar">
+            <div class="brand-row">
+                <div class="brand-mark small">D</div>
+                <strong>DevSync</strong>
+            </div>
+            <button class="sidebar-action" @onclick="ShowHomeAsync">워크스페이스</button>
+            <button class="sidebar-action secondary" @onclick="LeaveCurrentRoomAsync" disabled="@(hubConnection is null)">나가기</button>
+            @foreach (var room in myRooms.Where(x => x.IsApproved))
+            {
+                <button class="room-switch @(room.Id == activeRoomId ? "active" : "")" @onclick="() => EnterRoomAsync(room.Id)">
+                    <span># @room.Name</span>
+                    @if (mentionCounts.TryGetValue(room.Id, out var count) && count > 0)
+                    {
+                        <small class="mention-badge">@count</small>
+                    }
+                </button>
+            }
+        </aside>
+
+        <main class="workspace">
+            <header class="topbar">
+                <div class="workspace-title">
+                    <div>
+                        <h1>@roomName</h1>
+                        <p>초대 토큰: <code>@inviteToken</code></p>
+                    </div>
+                </div>
+                <div class="topbar-actions">
+                    <button type="button" class="leave-room-btn" @onclick="LeaveCurrentRoomAsync">나가기</button>
+                    <button type="button" class="create-task-btn" @onclick="ToggleTaskModal" title="새 작업 만들기">➕ 새 작업</button>
+                    <div class="notification-center">
+                        <button type="button"
+                                class="notification-button @(UnreadMentionCount > 0 ? "has-unread" : "")"
+                                title="멘션 알림"
+                                @onclick="ToggleNotificationPanel">
+                            <svg class="bell-icon" viewBox="0 0 24 24" aria-hidden="true">
+                                <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"></path>
+                                <path d="M13.7 21a2 2 0 0 1-3.4 0"></path>
+                            </svg>
+                            <em>멘션</em>
+                            @if (UnreadMentionCount > 0)
+                            {
+                                <span>@UnreadMentionCount</span>
+                            }
+                        </button>
+                        @if (showNotificationPanel)
+                        {
+                            <section class="notification-popover">
+                                <div class="notification-header">
+                                    <strong>멘션 알림</strong>
+                                    @if (mentionNotifications.Count > 0)
+                                    {
+                                        <button type="button" @onclick="MarkAllNotificationsReadAsync">모두 읽음</button>
+                                    }
+                                </div>
+                                @if (mentionNotifications.Count == 0)
+                                {
+                                    <p class="empty-notification">새 멘션이 없습니다.</p>
+                                }
+                                else
+                                {
+                                    @foreach (var notification in mentionNotifications.OrderByDescending(x => x.CreatedAt))
+                                    {
+                                        <button type="button"
+                                                class="notification-item @(notification.IsRead ? "read" : "")"
+                                                @onclick="() => OpenNotificationAsync(notification)">
+                                            <span># @notification.RoomName</span>
+                                            <strong>@notification.Title</strong>
+                                            <small>@notification.Body</small>
+                                        </button>
+                                    }
+                                }
+                            </section>
+                        }
+                    </div>
+                    <div class="account-pill">
+                        <span>@currentUser.DisplayName</span>
+                        <small>@currentUser.Email</small>
+                        <button @onclick="LogoutAsync">로그아웃</button>
+                    </div>
+                </div>
+            </header>
+
+            @if (!string.IsNullOrWhiteSpace(errorMessage))
+            {
+                <div class="alert">@errorMessage</div>
+            }
+
+            @if (IsCurrentUserOwner())
+            {
+                <section class="approval-panel">
+                    <div>
+                        <h2>초대 승인</h2>
+                        <p>초대 토큰으로 들어온 사용자는 방장이 승인해야 채팅과 보드에 접근할 수 있습니다.</p>
+                    </div>
+                    @if (PendingMembers.Count == 0)
+                    {
+                        <span class="muted">승인 대기자가 없습니다.</span>
+                    }
+                    else
+                    {
+                        <div class="approval-list">
+                            @foreach (var member in PendingMembers)
+                            {
+                                <article class="approval-row">
+                                    <strong>@member.DisplayName</strong>
+                                    <button @onclick="() => ApproveMemberAsync(member.UserId)">승인</button>
+                                </article>
+                            }
+                        </div>
+                    }
+                </section>
+            }
+
+            <section class="board-toolbar">
+                <input @bind="taskSearchText" @bind:event="oninput" placeholder="작업 검색" />
+                <select @bind="taskAssigneeFilter">
+                    <option value="">전체 담당자</option>
+                    @foreach (var member in ApprovedMembers)
+                    {
+                        <option value="@member.UserId">@member.DisplayName</option>
+                    }
+                </select>
+                <select @bind="taskPriorityFilter">
+                    <option value="">전체 우선순위</option>
+                    <option value="High">높음</option>
+                    <option value="Medium">중간</option>
+                    <option value="Low">낮음</option>
+                </select>
+            </section>
+
+            <div class="content-grid">
+                <aside class="chat-panel">
+                    <div class="panel-title">
+                        <span>실시간 채팅</span>
+                        <small>@(ApprovedMembers.Count)명</small>
+                    </div>
+                    <div class="chat-filter">
+                        <input @bind="chatSearchText" @bind:event="oninput" placeholder="채팅 검색" />
+                    </div>
+                    <div id="chat-messages" class="messages">
+                        @foreach (var message in FilteredMessages)
+                        {
+                            <article id="message-@message.Id" class="@GetMessageClass(message)">
+                                <strong>@message.SenderName</strong>
+                                <span>@RenderMentionText(message.Content)</span>
+                            </article>
+                        }
+                    </div>
+                    <div class="chat-actions">
+                        <form class="chat-form" @onsubmit="SendMessageAsync" @onsubmit:preventDefault="true">
+                            @if (MentionCandidates.Count > 0)
+                            {
+                                <div class="mention-menu">
+                                    @foreach (var member in MentionCandidates)
+                                    {
+                                        <button type="button" @onclick="() => InsertMention(member.DisplayName)">@@@member.DisplayName</button>
+                                    }
+                                </div>
+                            }
+                            <input value="@newMessage" @oninput="OnMessageInput" placeholder="@MentionPlaceholder" />
+                            <button type="submit">전송</button>
+                        </form>
+                    </div>
+                </aside>
+
+                <section class="board">
+                    @foreach (var status in boardStatuses)
+                    {
+                        <section class="column @GetDropClass(status)"
+                                 @ondragover:preventDefault="true"
+                                 @ondragover="() => dragOverStatus = status"
+                                 @ondragenter="() => dragOverStatus = status"
+                                 @ondragleave="() => ClearDragOver(status)"
+                                 @ondrop:preventDefault="true"
+                                 @ondrop="() => DropTaskAsync(status)">
+                            <h2>
+                                <span>@GetStatusTitle(status)</span>
+                                <small>@FilteredTasks.Count(x => x.Status == status)</small>
+                            </h2>
+                            @foreach (var task in FilteredTasks.Where(x => x.Status == status))
+                            {
+                                <article class="task-card"
+                                         draggable="true"
+                                         @ondragstart="() => StartDrag(task.Id)"
+                                         @ondragend="ClearDrag">
+                                    <h3>@task.Title</h3>
+                                    <p>@task.Description</p>
+                                    <div class="task-meta">
+                                        <span class="priority @GetPriorityClass(task.Priority)">@GetPriorityText(task.Priority)</span>
+                                        <span>@(task.DueDate?.ToString("yyyy-MM-dd") ?? "마감일 없음")</span>
+                                    </div>
+                                    <small>담당자: @(task.AssigneeName ?? "미정")</small>
+                                    <div class="actions">
+                                        <button disabled="@(task.Status == ProjectTaskStatus.Todo)" @onclick="() => ChangeStatusAsync(task, ProjectTaskStatus.Todo)">Todo</button>
+                                        <button disabled="@(task.Status == ProjectTaskStatus.InProgress)" @onclick="() => ChangeStatusAsync(task, ProjectTaskStatus.InProgress)">진행</button>
+                                        <button disabled="@(task.Status == ProjectTaskStatus.Done)" @onclick="() => ChangeStatusAsync(task, ProjectTaskStatus.Done)">완료</button>
+                                    </div>
+                                </article>
+                            }
+                        </section>
+                    }
+                </section>
+            </div>
+        </main>
+    </section>
+}
+
+@if (showTaskModal)
+{
+    <div class="modal-overlay" @onclick="ToggleTaskModal">
+        <div class="modal-content" @onclick:stopPropagation="true">
+            <div class="modal-header">
+                <h2>새 작업 만들기</h2>
+                <button type="button" class="modal-close" @onclick="ToggleTaskModal">✕</button>
+            </div>
+
+            <form class="modal-form" @onsubmit="CreateTaskFromModalAsync" @onsubmit:preventDefault="true">
+                <div class="form-group">
+                    <label>작업 이름 <span class="required">*</span></label>
+                    <input @bind="modalTaskTitle" placeholder="작업 제목을 입력하세요" required />
+                </div>
+
+                <div class="form-group">
+                    <label>설명</label>
+                    <textarea @bind="modalTaskDescription" placeholder="작업 내용을 입력하세요"></textarea>
+                </div>
+
+                <div class="form-group">
+                    <label>기간</label>
+                    <input @bind="modalTaskDueDate" type="date" />
+                </div>
+
+                <div class="form-group">
+                    <label>중요도</label>
+                    <select @bind="modalTaskPriority">
+                        <option value="Low">낮음</option>
+                        <option value="Medium">중간</option>
+                        <option value="High">높음</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>담당자</label>
+                    <select @bind="modalTaskAssigneeUserId">
+                        <option value="">미정</option>
+                        @foreach (var member in ApprovedMembers)
+                        {
+                            <option value="@member.UserId">@member.DisplayName</option>
+                        }
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>작업 상태</label>
+                    <select @bind="modalTaskStatusString">
+                        <option value="Todo">Todo</option>
+                        <option value="InProgress">InProgress</option>
+                        <option value="Done">Done</option>
+                    </select>
+                </div>
+
+                <div class="modal-actions">
+                    <button type="button" @onclick="ToggleTaskModal" class="btn-cancel">취소</button>
+                    <button type="submit" disabled="@(isBusy || string.IsNullOrWhiteSpace(modalTaskTitle))" class="btn-submit">작업 생성</button>
+                </div>
+            </form>
+        </div>
+    </div>
+}
+
+@code {
+    [Parameter] public int RoomId { get; set; } = 1;
+
+    private readonly ProjectTaskStatus[] boardStatuses =
+    [
+        ProjectTaskStatus.Todo,
+        ProjectTaskStatus.InProgress,
+        ProjectTaskStatus.Done
+    ];
+
+    private HubConnection? hubConnection;
+    private AuthResponse? currentUser;
+    private List<MyRoomDto> myRooms = [];
+    private List<RoomMemberDto> roomMembers = [];
+    private List<ProjectTaskDto> tasks = [];
+    private List<ChatMessageDto> messages = [];
+    private Dictionary<int, int> mentionCounts = [];
+    private List<AppNotification> mentionNotifications = [];
+    private ProjectTaskStatus? dragOverStatus;
+    private int? draggedTaskId;
+    private int activeRoomId = 1;
+    private string roomName = "";
+    private string inviteToken = "";
+    private string newMessage = "";
+    private string newRoomName = "";
+    private string inviteTokenInput = "devsync-demo-token";
+    private string loginEmail = "hong@example.com";
+    private string loginPassword = "Password123!";
+    private string registerName = "";
+    private string registerEmail = "";
+    private string registerPassword = "";
+    
+    // 작업 생성 모달 필드
+    private bool showTaskModal = false;
+    private string modalTaskTitle = "";
+    private string modalTaskDescription = "";
+    private DateTime? modalTaskDueDate = null;
+    private string modalTaskPriority = "High";
+    private string modalTaskAssigneeUserId = "";
+    private string modalTaskStatusString = "Todo";
+    private string taskSearchText = "";
+    private string taskAssigneeFilter = "";
+    private string taskPriorityFilter = "";
+    private string chatSearchText = "";
+    
+    private string? errorMessage;
+    private string? successMessage;
+    private bool isRegisterMode;
+    private bool isBusy;
+    private bool roomLoaded;
+    private bool showNotificationPanel;
+
+    private int UnreadMentionCount => mentionNotifications.Count(x => !x.IsRead);
+
+    private IReadOnlyList<RoomMemberDto> ApprovedMembers => roomMembers.Where(x => x.IsApproved).ToList();
+
+    private IReadOnlyList<RoomMemberDto> PendingMembers => roomMembers.Where(x => !x.IsApproved).ToList();
+
+    private IReadOnlyList<ProjectTaskDto> FilteredTasks => tasks
+        .Where(task => string.IsNullOrWhiteSpace(taskSearchText)
+            || task.Title.Contains(taskSearchText, StringComparison.OrdinalIgnoreCase)
+            || (task.Description?.Contains(taskSearchText, StringComparison.OrdinalIgnoreCase) ?? false))
+        .Where(task => string.IsNullOrWhiteSpace(taskAssigneeFilter)
+            || task.AssigneeUserId?.ToString() == taskAssigneeFilter)
+        .Where(task => string.IsNullOrWhiteSpace(taskPriorityFilter)
+            || task.Priority == taskPriorityFilter)
+        .ToList();
+
+    private IReadOnlyList<ChatMessageDto> FilteredMessages => messages
+        .Where(message => string.IsNullOrWhiteSpace(chatSearchText)
+            || message.SenderName.Contains(chatSearchText, StringComparison.OrdinalIgnoreCase)
+            || message.Content.Contains(chatSearchText, StringComparison.OrdinalIgnoreCase))
+        .ToList();
+
+    private IReadOnlyList<RoomMemberDto> MentionCandidates
+    {
+        get
+        {
+            var token = GetCurrentMentionToken();
+            if (token is null)
+            {
+                return [];
+            }
+
+            return ApprovedMembers
+                .Where(x => x.DisplayName.Contains(token, StringComparison.OrdinalIgnoreCase))
+                .Take(6)
+                .ToList();
+        }
+    }
+
+    private string MentionPlaceholder => ApprovedMembers.Count == 0
+        ? "메시지를 입력하세요"
+        : $"메시지를 입력하세요. 예: @{ApprovedMembers[0].DisplayName}";
+
+    protected override void OnInitialized()
+    {
+        activeRoomId = RoomId > 0 ? RoomId : 1;
+    }
+
+    private void SetAuthMode(bool registerMode)
+    {
+        isRegisterMode = registerMode;
+        errorMessage = null;
+        successMessage = null;
+    }
+
+    private Task LoginAsync()
+    {
+        return RunAuthAsync(() => Http.PostAsJsonAsync("api/auth/login", new LoginRequest(loginEmail, loginPassword)));
+    }
+
+    private Task RegisterAsync()
+    {
+        return RunAuthAsync(() => Http.PostAsJsonAsync("api/auth/register", new RegisterRequest(registerName, registerEmail, registerPassword)));
+    }
+
+    private async Task RunAuthAsync(Func<Task<HttpResponseMessage>> action)
+    {
+        errorMessage = null;
+        successMessage = null;
+        isBusy = true;
+
+        try
+        {
+            var response = await action();
+            if (!response.IsSuccessStatusCode)
+            {
+                errorMessage = await response.Content.ReadAsStringAsync();
+                return;
+            }
+
+            currentUser = await response.Content.ReadFromJsonAsync<AuthResponse>();
+            await LoadMyRoomsAsync();
+            await LoadNotificationsAsync();
+
+            var firstRoom = myRooms.FirstOrDefault(x => x.IsApproved && x.Id == activeRoomId)
+                ?? myRooms.FirstOrDefault(x => x.IsApproved);
+
+            if (firstRoom is not null)
+            {
+                await EnterRoomAsync(firstRoom.Id);
+            }
+        }
+        finally
+        {
+            isBusy = false;
+        }
+    }
+
+    private async Task LoadMyRoomsAsync()
+    {
+        if (currentUser is null)
+        {
+            return;
+        }
+
+        myRooms = await Http.GetFromJsonAsync<List<MyRoomDto>>($"api/rooms?userId={currentUser.UserId}") ?? [];
+    }
+
+    private async Task LoadNotificationsAsync()
+    {
+        if (currentUser is null)
+        {
+            return;
+        }
+
+        var notifications = await Http.GetFromJsonAsync<List<NotificationDto>>($"api/users/{currentUser.UserId}/notifications") ?? [];
+        mentionNotifications = notifications
+            .Select(x => new AppNotification(
+                x.Id,
+                x.UserId,
+                x.RoomId,
+                x.RoomName,
+                x.ChatMessageId,
+                x.Type,
+                x.Title,
+                x.Body,
+                x.CreatedAt,
+                x.IsRead))
+            .ToList();
+
+        mentionCounts = mentionNotifications
+            .Where(x => !x.IsRead)
+            .GroupBy(x => x.RoomId)
+            .ToDictionary(x => x.Key, x => x.Count());
+    }
+
+    private async Task EnterRoomAsync(int roomId)
+    {
+        activeRoomId = roomId;
+        mentionCounts.Remove(roomId);
+        roomLoaded = false;
+        errorMessage = null;
+        successMessage = null;
+        showNotificationPanel = false;
+        await ReloadRoomAsync();
+    }
+
+    private async Task ReloadRoomAsync()
+    {
+        if (currentUser is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var room = await Http.GetFromJsonAsync<RoomDto>($"api/rooms/{activeRoomId}?userId={currentUser.UserId}");
+            if (room is null)
+            {
+                return;
+            }
+
+            roomName = room.Name;
+            inviteToken = room.InviteToken;
+            tasks = await Http.GetFromJsonAsync<List<ProjectTaskDto>>($"api/rooms/{activeRoomId}/tasks?userId={currentUser.UserId}") ?? [];
+            messages = await Http.GetFromJsonAsync<List<ChatMessageDto>>($"api/rooms/{activeRoomId}/messages?userId={currentUser.UserId}") ?? [];
+            roomMembers = await Http.GetFromJsonAsync<List<RoomMemberDto>>($"api/rooms/{activeRoomId}/members?userId={currentUser.UserId}") ?? [];
+            await LoadNotificationsAsync();
+
+            await ConnectHubAsync();
+            roomLoaded = true;
+            await JS.InvokeVoidAsync("devSyncNotifications.bindChatViewport", activeRoomId);
+            await JS.InvokeVoidAsync("devSyncNotifications.restoreChatViewport", activeRoomId);
+        }
+        catch (Exception ex)
+        {
+            roomLoaded = false;
+            errorMessage = $"룸에 들어가지 못했습니다: {ex.Message}";
+        }
+    }
+
+    private async Task CreateRoomAsync()
+    {
+        if (currentUser is null || string.IsNullOrWhiteSpace(newRoomName))
+        {
+            return;
+        }
+
+        isBusy = true;
+        errorMessage = null;
+
+        try
+        {
+            var response = await Http.PostAsJsonAsync("api/rooms", new CreateRoomRequest(newRoomName, currentUser.UserId));
+            if (!response.IsSuccessStatusCode)
+            {
+                errorMessage = await response.Content.ReadAsStringAsync();
+                return;
+            }
+
+            var room = await response.Content.ReadFromJsonAsync<RoomDto>();
+            newRoomName = "";
+            await LoadMyRoomsAsync();
+
+            if (room is not null)
+            {
+                await EnterRoomAsync(room.Id);
+            }
+        }
+        finally
+        {
+            isBusy = false;
+        }
+    }
+
+    private async Task JoinByTokenAsync()
+    {
+        if (currentUser is null || string.IsNullOrWhiteSpace(inviteTokenInput))
+        {
+            return;
+        }
+
+        isBusy = true;
+        errorMessage = null;
+        successMessage = null;
+
+        try
+        {
+            var response = await Http.PostAsJsonAsync("api/rooms/join-by-token", new JoinRoomByTokenRequest(inviteTokenInput, currentUser.UserId));
+            if (!response.IsSuccessStatusCode)
+            {
+                errorMessage = await response.Content.ReadAsStringAsync();
+                return;
+            }
+
+            var result = await response.Content.ReadFromJsonAsync<JoinRoomResultDto>();
+            await LoadMyRoomsAsync();
+            await LoadNotificationsAsync();
+
+            if (result is not null && result.IsApproved)
+            {
+                await EnterRoomAsync(result.RoomId);
+            }
+            else
+            {
+                successMessage = result is null ? "참여 신청이 등록되었습니다." : $"'{result.RoomName}' 참여 신청이 등록되었습니다. 방장 승인을 기다려 주세요.";
+            }
+        }
+        finally
+        {
+            isBusy = false;
+        }
+    }
+
+    private async Task ApproveMemberAsync(int userIdToApprove)
+    {
+        if (currentUser is null)
+        {
+            return;
+        }
+
+        var response = await Http.PostAsJsonAsync(
+            $"api/rooms/{activeRoomId}/approve",
+            new ApproveMemberRequest(currentUser.UserId, userIdToApprove));
+
+        if (!response.IsSuccessStatusCode)
+        {
+            errorMessage = await response.Content.ReadAsStringAsync();
+            return;
+        }
+
+        roomMembers = await Http.GetFromJsonAsync<List<RoomMemberDto>>($"api/rooms/{activeRoomId}/members?userId={currentUser.UserId}") ?? [];
+    }
+
+    private async Task LeaveMembershipAsync(MyRoomDto room)
+    {
+        if (currentUser is null || room.IsOwner)
+        {
+            return;
+        }
+
+        var confirmed = await JS.InvokeAsync<bool>("confirm", $"'{room.Name}' 룸에서 탈퇴할까요?");
+        if (!confirmed)
+        {
+            return;
+        }
+
+        if (room.Id == activeRoomId)
+        {
+            await LeaveCurrentRoomAsync();
+        }
+
+        var response = await Http.DeleteAsync($"api/rooms/{room.Id}/members/{currentUser.UserId}?requesterUserId={currentUser.UserId}");
+        if (!response.IsSuccessStatusCode)
+        {
+            errorMessage = await response.Content.ReadAsStringAsync();
+            return;
+        }
+
+        await LoadMyRoomsAsync();
+        await LoadNotificationsAsync();
+        successMessage = $"'{room.Name}' 룸에서 탈퇴했습니다.";
+    }
+
+
+    private async Task ShowHomeAsync()
+    {
+        await LeaveCurrentRoomAsync();
+        await LoadMyRoomsAsync();
+        await LoadNotificationsAsync();
+    }
+
+    private async Task LeaveCurrentRoomAsync()
+    {
+        if (currentUser is not null)
+        {
+            await JS.InvokeVoidAsync("devSyncNotifications.saveLastSeenMessage", activeRoomId);
+        }
+
+        if (hubConnection is not null)
+        {
+            try
+            {
+                await hubConnection.InvokeAsync("LeaveRoom", activeRoomId);
+            }
+            catch
+            {
+                // 이미 끊긴 연결이면 무시하고 정리만 진행합니다.
+            }
+
+            await hubConnection.DisposeAsync();
+            hubConnection = null;
+        }
+
+        roomLoaded = false;
+        errorMessage = null;
+        successMessage = null;
+        tasks = [];
+        messages = [];
+        roomMembers = [];
+    }
+
+    private async Task ConnectHubAsync()
+    {
+        if (currentUser is null)
+        {
+            return;
+        }
+
+        if (hubConnection is not null)
+        {
+            await hubConnection.DisposeAsync();
+        }
+
+        hubConnection = new HubConnectionBuilder()
+            .WithUrl(new Uri("http://localhost:5010/hubs/project"))
+            .WithAutomaticReconnect()
+            .Build();
+
+        hubConnection.On<ChatMessageDto>("ReceiveMessage", message =>
+        {
+            if (message.RoomId == activeRoomId)
+            {
+                messages.Add(message);
+            }
+
+            InvokeAsync(async () =>
+            {
+                StateHasChanged();
+                if (message.RoomId == activeRoomId && message.SenderUserId == currentUser?.UserId)
+                {
+                    await Task.Delay(10);
+                    await JS.InvokeVoidAsync("devSyncNotifications.scrollToMessage", $"message-{message.Id}");
+                }
+            });
+        });
+
+        hubConnection.On<NotificationDto>("ReceiveNotification", notification =>
+        {
+            if (notification.UserId != currentUser.UserId)
+            {
+                return;
+            }
+
+            AddNotification(notification);
+            InvokeAsync(StateHasChanged);
+        });
+
+        hubConnection.On<ProjectTaskDto>("TaskChanged", changedTask =>
+        {
+            var index = tasks.FindIndex(x => x.Id == changedTask.Id);
+            if (index >= 0)
+            {
+                tasks[index] = changedTask;
+            }
+            else
+            {
+                tasks.Add(changedTask);
+            }
+
+            InvokeAsync(StateHasChanged);
+        });
+
+        await hubConnection.StartAsync();
+        var approvedRoomIds = myRooms.Where(x => x.IsApproved).Select(x => x.Id).ToList();
+        await hubConnection.InvokeAsync("JoinRooms", approvedRoomIds, currentUser.UserId);
+    }
+
+    private async Task SendMessageAsync()
+    {
+        if (hubConnection is null || currentUser is null || string.IsNullOrWhiteSpace(newMessage))
+        {
+            return;
+        }
+
+        await hubConnection.InvokeAsync("SendMessage", activeRoomId, currentUser.UserId, newMessage);
+        newMessage = "";
+    }
+
+    private void OnMessageInput(ChangeEventArgs args)
+    {
+        newMessage = args.Value?.ToString() ?? "";
+    }
+
+    private string? GetCurrentMentionToken()
+    {
+        var atIndex = newMessage.LastIndexOf('@');
+        if (atIndex < 0)
+        {
+            return null;
+        }
+
+        var token = newMessage[(atIndex + 1)..];
+        if (token.Contains(' ') || token.Contains('\n'))
+        {
+            return null;
+        }
+
+        return token;
+    }
+
+    private void InsertMention(string displayName)
+    {
+        var atIndex = newMessage.LastIndexOf('@');
+        if (atIndex < 0)
+        {
+            newMessage = $"{newMessage}@{displayName} ";
+            return;
+        }
+
+        newMessage = $"{newMessage[..atIndex]}@{displayName} ";
+    }
+
+    private void ToggleNotificationPanel()
+    {
+        showNotificationPanel = !showNotificationPanel;
+    }
+
+    private void AddNotification(NotificationDto notification)
+    {
+        var appNotification = new AppNotification(
+            notification.Id,
+            notification.UserId,
+            notification.RoomId,
+            notification.RoomName,
+            notification.ChatMessageId,
+            notification.Type,
+            notification.Title,
+            notification.Body,
+            notification.CreatedAt,
+            notification.IsRead);
+
+        var existingIndex = mentionNotifications.FindIndex(x => x.Id == notification.Id);
+        var isNewNotification = existingIndex < 0;
+        if (existingIndex >= 0)
+        {
+            mentionNotifications[existingIndex] = appNotification;
+        }
+        else
+        {
+            mentionNotifications.Add(appNotification);
+        }
+
+        if (isNewNotification && !notification.IsRead)
+        {
+            mentionCounts[notification.RoomId] = mentionCounts.TryGetValue(notification.RoomId, out var current)
+                ? current + 1
+                : 1;
+
+            _ = InvokeAsync(async () =>
+            {
+                await JS.InvokeVoidAsync("devSyncNotifications.playMention");
+                await JS.InvokeVoidAsync("devSyncNotifications.highlightBell");
+            });
+        }
+    }
+
+    private async Task OpenNotificationAsync(AppNotification notification)
+    {
+        showNotificationPanel = false;
+        await MarkNotificationReadAsync(notification.Id);
+
+        if (notification.RoomId != activeRoomId)
+        {
+            await EnterRoomAsync(notification.RoomId);
+        }
+
+        if (notification.ChatMessageId is not null)
+        {
+            await Task.Delay(80);
+            await JS.InvokeVoidAsync("devSyncNotifications.scrollToMessage", $"message-{notification.ChatMessageId}");
+        }
+    }
+
+    private async Task MarkNotificationReadAsync(int notificationId)
+    {
+        var index = mentionNotifications.FindIndex(x => x.Id == notificationId);
+        if (index < 0)
+        {
+            return;
+        }
+
+        var current = mentionNotifications[index];
+        mentionNotifications[index] = current with { IsRead = true };
+
+        if (currentUser is not null && !current.IsRead)
+        {
+            await Http.PatchAsync($"api/users/{currentUser.UserId}/notifications/{notificationId}/read", null);
+        }
+
+        if (mentionCounts.TryGetValue(current.RoomId, out var count))
+        {
+            mentionCounts[current.RoomId] = Math.Max(0, count - 1);
+        }
+    }
+
+    private async Task MarkAllNotificationsReadAsync()
+    {
+        if (currentUser is not null)
+        {
+            await Http.PatchAsync($"api/users/{currentUser.UserId}/notifications/read-all", null);
+        }
+
+        mentionNotifications = mentionNotifications.Select(x => x with { IsRead = true }).ToList();
+        mentionCounts.Clear();
+    }
+
+    private bool IsMentionedMe(ChatMessageDto message)
+    {
+        return currentUser is not null && message.MentionedUserIds.Contains(currentUser.UserId);
+    }
+
+    private string GetMessageClass(ChatMessageDto message)
+    {
+        var className = message.IsSystem ? "message system" : "message";
+        return IsMentionedMe(message) ? $"{className} mentioned" : className;
+    }
+
+    private MarkupString RenderMentionText(string content)
+    {
+        var encoded = System.Net.WebUtility.HtmlEncode(content);
+        foreach (var member in ApprovedMembers)
+        {
+            var mention = $"@{member.DisplayName}";
+            var encodedMention = System.Net.WebUtility.HtmlEncode(mention);
+            var mentionClass = member.UserId == currentUser?.UserId ? "my-mention" : "plain-mention";
+            encoded = encoded.Replace(encodedMention, $"<span class=\"{mentionClass}\">{encodedMention}</span>", StringComparison.OrdinalIgnoreCase);
+        }
+
+        return new MarkupString(encoded);
+    }
+
+    private string GetRoomName(int roomId)
+    {
+        return myRooms.FirstOrDefault(x => x.Id == roomId)?.Name
+            ?? (roomId == activeRoomId ? roomName : $"Room {roomId}");
+    }
+
+    private static string TrimPreview(string content)
+    {
+        var preview = content.ReplaceLineEndings(" ").Trim();
+        return preview.Length <= 64 ? preview : $"{preview[..61]}...";
+    }
+
+    private async Task ChangeStatusAsync(ProjectTaskDto task, ProjectTaskStatus newStatus)
+    {
+        if (currentUser is null)
+        {
+            return;
+        }
+
+        var response = await Http.PatchAsJsonAsync(
+            $"api/rooms/{activeRoomId}/tasks/{task.Id}/status",
+            new UpdateTaskStatusRequest(currentUser.UserId, newStatus));
+
+        if (!response.IsSuccessStatusCode)
+        {
+            errorMessage = await response.Content.ReadAsStringAsync();
+            return;
+        }
+    }
+
+
+
+    private void StartDrag(int taskId)
+    {
+        draggedTaskId = taskId;
+    }
+
+    private void ClearDrag()
+    {
+        draggedTaskId = null;
+        dragOverStatus = null;
+    }
+
+    private void ClearDragOver(ProjectTaskStatus status)
+    {
+        if (dragOverStatus == status)
+        {
+            dragOverStatus = null;
+        }
+    }
+
+    private async Task DropTaskAsync(ProjectTaskStatus newStatus)
+    {
+        if (draggedTaskId is null)
+        {
+            return;
+        }
+
+        var taskIndex = tasks.FindIndex(x => x.Id == draggedTaskId.Value);
+        if (taskIndex < 0)
+        {
+            ClearDrag();
+            return;
+        }
+
+        var task = tasks[taskIndex];
+        var oldStatus = task.Status;
+        ClearDrag();
+
+        if (oldStatus == newStatus)
+        {
+            return;
+        }
+
+        tasks[taskIndex] = task with { Status = newStatus };
+        StateHasChanged();
+
+        if (currentUser is null)
+        {
+            return;
+        }
+
+        var response = await Http.PatchAsJsonAsync(
+            $"api/rooms/{activeRoomId}/tasks/{task.Id}/status",
+            new UpdateTaskStatusRequest(currentUser.UserId, newStatus));
+
+        if (!response.IsSuccessStatusCode)
+        {
+            errorMessage = await response.Content.ReadAsStringAsync();
+            var rollbackIndex = tasks.FindIndex(x => x.Id == task.Id);
+            if (rollbackIndex >= 0)
+            {
+                tasks[rollbackIndex] = tasks[rollbackIndex] with { Status = oldStatus };
+            }
+        }
+    }
+
+    private async Task LogoutAsync()
+    {
+        currentUser = null;
+        roomLoaded = false;
+        myRooms = [];
+        tasks = [];
+        messages = [];
+        roomMembers = [];
+        mentionCounts = [];
+        mentionNotifications = [];
+        showNotificationPanel = false;
+        errorMessage = null;
+        successMessage = null;
+
+        if (hubConnection is not null)
+        {
+            await hubConnection.DisposeAsync();
+            hubConnection = null;
+        }
+    }
+
+    private static string GetStatusTitle(ProjectTaskStatus status)
+    {
+        return status switch
+        {
+            ProjectTaskStatus.Todo => "Todo",
+            ProjectTaskStatus.InProgress => "In Progress",
+            ProjectTaskStatus.Done => "Done",
+            _ => status.ToString()
+        };
+    }
+
+    private static string GetPriorityText(string priority)
+    {
+        return priority switch
+        {
+            "High" => "높음",
+            "Low" => "낮음",
+            _ => "중간"
+        };
+    }
+
+    private static string GetPriorityClass(string priority)
+    {
+        return priority switch
+        {
+            "High" => "high",
+            "Low" => "low",
+            _ => "medium"
+        };
+    }
+
+    private bool IsCurrentUserOwner()
+    {
+        return myRooms.Any(x => x.Id == activeRoomId && x.IsOwner);
+    }
+
+    private string GetDropClass(ProjectTaskStatus status)
+    {
+        return dragOverStatus == status ? "drop-target" : "";
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        await LeaveCurrentRoomAsync();
+    }
+
+    private void ToggleTaskModal()
+    {
+        showTaskModal = !showTaskModal;
+        if (!showTaskModal)
+        {
+            ResetModalForm();
+        }
+    }
+
+    private void ResetModalForm()
+    {
+        modalTaskTitle = "";
+        modalTaskDescription = "";
+        modalTaskDueDate = null;
+        modalTaskPriority = "High";
+        modalTaskAssigneeUserId = "";
+        modalTaskStatusString = "Todo";
+    }
+
+    private async Task CreateTaskFromModalAsync()
+    {
+        if (currentUser is null || string.IsNullOrWhiteSpace(modalTaskTitle))
+        {
+            return;
+        }
+
+        isBusy = true;
+        errorMessage = null;
+
+        try
+        {
+            var selectedStatus = Enum.Parse<ProjectTaskStatus>(modalTaskStatusString);
+            var assigneeUserId = int.TryParse(modalTaskAssigneeUserId, out var parsedAssigneeUserId)
+                ? parsedAssigneeUserId
+                : (int?)null;
+
+            var response = await Http.PostAsJsonAsync(
+                $"api/rooms/{activeRoomId}/tasks?userId={currentUser.UserId}",
+                new CreateProjectTaskRequest(
+                    modalTaskTitle,
+                    string.IsNullOrWhiteSpace(modalTaskDescription) ? null : modalTaskDescription,
+                    assigneeUserId,
+                    modalTaskPriority,
+                    modalTaskDueDate,
+                    selectedStatus));
+
+            if (!response.IsSuccessStatusCode)
+            {
+                errorMessage = await response.Content.ReadAsStringAsync();
+                return;
+            }
+
+            var createdTask = await response.Content.ReadFromJsonAsync<ProjectTaskDto>();
+            if (createdTask is not null)
+            {
+                var existingIndex = tasks.FindIndex(x => x.Id == createdTask.Id);
+                if (existingIndex >= 0)
+                {
+                    tasks[existingIndex] = createdTask;
+                }
+                else
+                {
+                    tasks.Add(createdTask);
+                }
+            }
+
+            ToggleTaskModal();
+        }
+        catch (Exception ex)
+        {
+            errorMessage = $"작업 생성 실패: {ex.Message}";
+        }
+        finally
+        {
+            isBusy = false;
+        }
+    }
+
+    private sealed record AppNotification(
+        int Id,
+        int UserId,
+        int RoomId,
+        string RoomName,
+        int? ChatMessageId,
+        string Type,
+        string Title,
+        string Body,
+        DateTimeOffset CreatedAt,
+        bool IsRead);
+}

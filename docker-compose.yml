@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: devsync-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "devsync_root_password"
+      MYSQL_DATABASE: "DevSyncDb"
+    ports:
+      - "3306:3306"
+    volumes:
+      - devsync-mysql-data:/var/lib/mysql
+
+  api:
+    build:
+      context: .
+      dockerfile: src/DevSync.Api/Dockerfile
+    container_name: devsync-api
+    environment:
+      ASPNETCORE_URLS: "http://+:8080"
+      ASPNETCORE_ENVIRONMENT: "Development"
+      DatabaseProvider: "MySql"
+      ResetDatabaseOnStartup: "true"
+      ConnectionStrings__DefaultConnection: "Server=mysql;Port=3306;Database=DevSyncDb;User=root;Password=devsync_root_password;"
+    ports:
+      - "5010:8080"
+    depends_on:
+      - mysql
+
+  client:
+    build:
+      context: .
+      dockerfile: src/DevSync.Client/Dockerfile
+    container_name: devsync-client
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+volumes:
+  devsync-mysql-data:
